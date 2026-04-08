@@ -40,6 +40,7 @@ class CMMFeature:
     dev: float
     outtol: float
     page: int
+    suspect: bool = False   # True when OCR value is physically implausible
 
     @property
     def out_of_tol(self):
@@ -47,6 +48,8 @@ class CMMFeature:
 
     @property
     def status(self):
+        if self.suspect:
+            return "SUSPECT"
         return "OOT" if self.out_of_tol else "OK"
 
     @property
@@ -70,7 +73,8 @@ class CMMFeature:
             "meas": self.meas,
             "dev": round(self.dev, 4), "outtol": round(self.outtol, 4),
             "out_of_tol": self.out_of_tol, "status": self.status,
-            "tol_used_pct": self.tol_used_pct, "page": self.page,
+            "suspect": self.suspect, "tol_used_pct": self.tol_used_pct,
+            "page": self.page,
         }
 
 
@@ -345,6 +349,39 @@ RE_FEAT_HEADER = re.compile(
 RE_FEAT_NAME = re.compile(r"\b(CIR|PLN|CYL|LIN|PNT|SET)\s*([A-Z0-9]+)\b", re.IGNORECASE)
 
 
+def _sanitize_meas(
+    nominal: float, meas: float, plus_tol: float, minus_tol: float
+) -> Tuple[float, float, bool]:
+    """Return (fixed_meas, dev, suspect).
+
+    Two OCR artefacts are corrected here:
+
+    1. Sign-flip: Tesseract sometimes drops the minus sign from a negative
+       measurement value.  If nominal < 0 and the raw meas is positive with
+       a magnitude close to |nominal|, the sign was likely dropped.
+       Example: nominal=-2.200, OCR meas=+2.212 → fixed meas=-2.212, dev=-0.012
+
+    2. Impossible deviation: |dev| >> tolerance band by ×100 or ≥50mm means
+       the OCR picked up a page number or an adjacent column value.
+       The feature is kept but flagged as suspect so the HTML can warn the user.
+    """
+    tol_band = plus_tol + minus_tol
+
+    # --- Sign-flip correction -----------------------------------------------
+    if nominal < -1e-6 and meas > 1e-6:
+        # How close is |meas| to |nominal|?  Within 3× tolerance band is safe.
+        if abs(meas + nominal) <= max(tol_band * 3, 0.5):
+            meas = -meas
+
+    dev = round(meas - nominal, 6)
+
+    # --- Implausibility check ------------------------------------------------
+    max_reasonable = max(tol_band * 100, 50.0)
+    suspect = abs(dev) > max_reasonable
+
+    return meas, dev, suspect
+
+
 def _compute_outtol(dev: float, plus_tol: float, minus_tol: float) -> float:
     """Return the out-of-tolerance amount (≥0) computed purely from the
     deviation and tolerance values, independent of the OCR'd outtol column."""
@@ -575,14 +612,14 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                             nominal = float(m.group(1))
                             plus_t  = float(m.group(2))
                             minus_t = float(m.group(3))
-                            meas    = float(m.group(4))
-                            dev     = round(meas - nominal, 6)
+                            meas, dev, susp = _sanitize_meas(
+                                nominal, float(m.group(4)), plus_t, minus_t)
                             features.append(CMMFeature(
                                 name=name, feature_type=ftype, axis="D",
                                 nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
                                 meas=meas, dev=dev,
                                 outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
+                                page=page_num + 1, suspect=susp,
                             ))
                         except ValueError:
                             pass
@@ -601,14 +638,14 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                             nominal = float(m.group(2))
                             plus_t  = float(m.group(3))
                             minus_t = float(m.group(4))
-                            meas    = float(m.group(5))
-                            dev     = round(meas - nominal, 6)
+                            meas, dev, susp = _sanitize_meas(
+                                nominal, float(m.group(5)), plus_t, minus_t)
                             features.append(CMMFeature(
                                 name=name, feature_type=ftype, axis=m.group(1),
                                 nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
                                 meas=meas, dev=dev,
                                 outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
+                                page=page_num + 1, suspect=susp,
                             ))
                         except ValueError:
                             pass
@@ -625,15 +662,15 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                             nominal = float(m.group(2))
                             plus_t  = float(m.group(3))
                             minus_t = float(m.group(4)) if m.group(4) else plus_t
-                            meas    = float(m.group(5))
-                            dev     = round(meas - nominal, 6)   # computed, not OCR
+                            meas, dev, susp = _sanitize_meas(
+                                nominal, float(m.group(5)), plus_t, minus_t)
                             features.append(CMMFeature(
                                 name=fname, feature_type=type_m.group(1).upper(),
                                 axis="F",
                                 nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
                                 meas=meas, dev=dev,
                                 outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
+                                page=page_num + 1, suspect=susp,
                             ))
                             # The embedded name also becomes the context for
                             # any following D/axis rows in this block.
@@ -752,6 +789,8 @@ def correlate(
     for feat in cmm_features:
         if abs(feat.dev) < 0.0001:
             continue
+        if feat.suspect:
+            continue  # OCR artefact — no recommendation
 
         # Correction targets the tolerance band centre (midpoint).
         # When plus_tol == minus_tol, tol_midpoint == 0 → same as -dev.
@@ -1517,10 +1556,12 @@ Examples:
 
     t0 = time.time()
     cmm_features = parse_cmm_pdf(cmm_path, verbose=True)
-    oot = [f for f in cmm_features if f.out_of_tol]
+    oot     = [f for f in cmm_features if f.out_of_tol and not f.suspect]
+    suspect = [f for f in cmm_features if f.suspect]
 
+    susp_str = f", {len(suspect)} SUSPECT" if suspect else ""
     done(f"{len(cmm_features)} features parsed  "
-         f"({len(oot)} OOT, {len(cmm_features)-len(oot)} OK)  "
+         f"({len(oot)} OOT, {len(cmm_features)-len(oot)-len(suspect)} OK{susp_str})  "
          f"({time.time()-t0:.0f}s)")
 
     # ── 3. Correlate ─────────────────────────────────────────

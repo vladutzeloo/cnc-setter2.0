@@ -146,14 +146,36 @@ CANNED_CYCLE = re.compile(
 CONTINUATION = re.compile(r"^X([\d\.-]+)\s+Y([\d\.-]+)$")
 
 
+_RE_OP_DIA   = re.compile(r'\bD(\d+\.?\d*)\b')
+_RE_OP_TOOL  = re.compile(r'\bT(\w+)\b')
+_SKIP_OP_KWS = ("DRILL", "REAM", "CHAMFER", "THREAD", "PECKING", "PILOT",
+                 "SPOT", "CENTER")
+
+
 def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
-    """Parse a single NC file. Returns (holes, ops_summary)."""
+    """Parse a single NC file. Returns (holes, ops_summary).
+
+    In addition to canned-cycle holes (G83/G85), also creates virtual
+    MILL_CIRCLE entries for milling operations whose OPERATION comment
+    contains an explicit machined diameter (e.g. "T197 D158.4 FINISH").
+    These are used to match large-bore CMM features that are machined
+    by circular interpolation rather than canned cycles.
+    """
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.read().splitlines()
 
     op_name = Path(filepath).stem
     holes: List[NCHole] = []
     ops_summary: List[dict] = []
+
+    # Build tool registry from all TOOL comments (they appear at file top).
+    # This avoids the stale cur_tool_desc bug where only the last TOOL comment
+    # was remembered by the time each OPERATION comment was encountered.
+    tool_registry: dict = {}   # tool_num → tool_desc
+    for raw in lines:
+        tm = re.match(r"\(\s*TOOL\s+(\S+):\s+(.+?)\s*\)", raw.strip())
+        if tm:
+            tool_registry[tm.group(1)] = tm.group(2).strip()
 
     cur_tool = None
     cur_tool_desc = None
@@ -166,6 +188,8 @@ def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
         m = re.match(r"T(\w+)\s+M6", line)
         if m:
             cur_tool = m.group(1)
+            # Update cur_tool_desc from registry on tool change
+            cur_tool_desc = tool_registry.get(cur_tool, cur_tool_desc)
 
         m = re.match(r"\(\s*TOOL\s+\S+:\s+(.+?)\s*\)", line)
         if m:
@@ -173,9 +197,14 @@ def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
 
         m = re.match(r"\(\s*OPERATION\s+(\d+):\s+(.+?)\s*\)", line)
         if m:
+            op_desc = m.group(2)
+            # Resolve tool desc: try tool embedded in operation description
+            mt = _RE_OP_TOOL.search(op_desc)
+            op_tool = mt.group(1) if mt else cur_tool
+            op_tool_desc = tool_registry.get(op_tool or "", "") or cur_tool_desc or ""
             cur_op = {
-                "num": m.group(1), "desc": m.group(2),
-                "tool": cur_tool, "tool_desc": cur_tool_desc, "n_holes": 0,
+                "num": m.group(1), "desc": op_desc,
+                "tool": op_tool, "tool_desc": op_tool_desc, "n_holes": 0,
             }
             ops_summary.append(cur_op)
 
@@ -206,6 +235,32 @@ def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
             holes.append(h)
             cur_op["n_holes"] += 1
             last_hole = h
+
+    # ── Circular milling ops: create virtual MILL_CIRCLE entries ─────────
+    # HyperMill sometimes encodes the machined bore diameter directly in the
+    # OPERATION comment, e.g. "T197 D158.4 FINISH".  Capture these so the
+    # correlation engine can match them to large-bore CMM circle features.
+    for op in ops_summary:
+        desc = op.get("desc", "")
+        m_dia = _RE_OP_DIA.search(desc)
+        if not m_dia:
+            continue
+        machined_dia = float(m_dia.group(1))
+        if machined_dia <= 0:
+            continue
+        # Skip operations already covered by canned cycles (drill/ream/etc.)
+        desc_upper = desc.upper()
+        if any(kw in desc_upper for kw in _SKIP_OP_KWS):
+            continue
+        tool_str = op.get("tool") or ""
+        tool_desc_str = op.get("tool_desc") or ""
+        holes.append(NCHole(
+            op_file=op_name, op_num=op["num"], desc=desc,
+            tool=tool_str, tool_desc=tool_desc_str,
+            tool_type="MILL",
+            tool_dia=machined_dia, cycle="MILL_CIRCLE",
+            x=0.0, y=0.0, z=0.0,
+        ))
 
     return holes, ops_summary
 
@@ -565,7 +620,30 @@ def _find_dia_match(
                     f"Boring bar T{h.tool} D{h.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
                 )
 
-    # 4. No match
+    # 4. Circular milling op — diameter encoded in operation description
+    #    (HyperMill writes e.g. "T197 D158.4 FINISH" for a bore pass)
+    best_mill: Optional[NCHole] = None
+    best_mill_diff = float("inf")
+    for h in nc_holes:
+        if h.cycle == "MILL_CIRCLE" and h.tool_dia > 0:
+            diff = abs(h.tool_dia - feat.nominal)
+            if diff < best_mill_diff:
+                best_mill_diff = diff
+                best_mill = h
+    if best_mill is not None:
+        if best_mill_diff < 0.5:
+            return best_mill, "HIGH", (
+                f"Circular mill T{best_mill.tool} machined "
+                f"Ø{best_mill.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
+            )
+        if best_mill_diff < 3.0:
+            return best_mill, "MEDIUM", (
+                f"Nearest circular mill T{best_mill.tool} "
+                f"Ø{best_mill.tool_dia:.3f}mm (Δ{best_mill_diff:.2f}mm) "
+                f"→ nominal Ø{feat.nominal:.3f}mm"
+            )
+
+    # 5. No match
     if feat.nominal > 15:
         msg = f"Large bore Ø{feat.nominal:.3f}mm — assign manually (milling/boring op)"
     else:
@@ -591,12 +669,23 @@ def correlate(
     from collections import defaultdict
 
     # ── Pass 1: resolve each diameter feature → best NC tool ─────────────
-    # Keyed by feature name so that Z/M/T rows of the *same* feature can
-    # inherit the matched tool without a second diameter search.
-    dia_cache: dict = {}   # name → (NCHole|None, confidence, reason)
+    # Key: (name, nominal) so that a feature name that appears at multiple
+    # diameters (e.g. CIR78 at Ø158.4 AND Ø182.0) each gets its own match.
+    dia_cache: dict = {}   # (name, nominal) → (NCHole|None, confidence, reason)
     for feat in cmm_features:
-        if feat.axis == "D" and feat.name not in dia_cache:
-            dia_cache[feat.name] = _find_dia_match(feat, nc_holes)
+        key = (feat.name, feat.nominal)
+        if feat.axis == "D" and key not in dia_cache:
+            dia_cache[key] = _find_dia_match(feat, nc_holes)
+
+    def _best_dia_for_name(name: str):
+        """Return the best (hole, confidence, reason) cached for any nominal
+        of *name*, preferring HIGH > MEDIUM > LOW, then smallest LOW nominal."""
+        candidates = [v for (n, _), v in dia_cache.items() if n == name]
+        if not candidates:
+            return None, "LOW", ""
+        order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        candidates.sort(key=lambda v: order.get(v[1], 9))
+        return candidates[0]
 
     # ── Pass 2: build recommendations for every feature with a deviation ──
     recs: List[OffsetRecommendation] = []
@@ -616,18 +705,18 @@ def correlate(
 
         if feat.axis == "D":
             matched, confidence, reason = dia_cache.get(
-                feat.name, (None, "LOW", f"No matching tool for Ø{feat.nominal:.3f}mm")
+                (feat.name, feat.nominal),
+                (None, "LOW", f"No matching tool for Ø{feat.nominal:.3f}mm"),
             )
             direction = "RADIAL (diameter)"
 
         elif feat.axis in ("Z", "M", "T"):
             direction = "AXIAL"
-            # Inherit the NC operation from the diameter match of this same
-            # feature (e.g. CIR85-D already resolved to a reamer; the CIR85-Z
-            # depth measurement belongs to the same machining step).
-            cached = dia_cache.get(feat.name)
-            if cached and cached[0] is not None:
-                matched, _, _ = cached
+            # Inherit the NC operation from the best diameter match for this
+            # feature name.  Works even when multiple bores share a name.
+            cached_hole, cached_conf, _ = _best_dia_for_name(feat.name)
+            if cached_hole is not None:
+                matched = cached_hole
                 confidence = "MEDIUM"
                 reason = (
                     f"{feat.axis}-axis on {feat.feature_type} {feat.name} "

@@ -17,9 +17,11 @@ Dependencies:
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -261,6 +263,64 @@ def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
             tool_dia=machined_dia, cycle="MILL_CIRCLE",
             x=0.0, y=0.0, z=0.0,
         ))
+
+    # ── Circular milling from G3/G2 arc radii ────────────────────────────
+    # When G41/G42 cutter compensation is active (standard in HyperMill),
+    # the programmed G3/G2 arc radius equals the bore radius of the machined
+    # circle.  Machined diameter = 2 × arc radius.
+    #
+    # Strategy: for each operation, count how many times each arc radius
+    # appears.  A radius that appears ≥2 times is a bore pass (helical
+    # milling repeats the same radius many times); a one-off arc is just a
+    # lead-in or corner.  Skip radii < 10mm (they're contour corners, not
+    # bores we would measure with CMM).
+    RE_G23 = re.compile(
+        r"^G[23]\s+.*?I\s*([-\d.]+)\s+J\s*([-\d.]+)", re.IGNORECASE
+    )
+    # Collect arc diameters per operation
+    op_arc_dias: dict = {op["num"]: Counter() for op in ops_summary}
+    cur_op_num_arc = None
+    for raw in lines:
+        raw = raw.strip()
+        mm = re.match(r"\(\s*OPERATION\s+(\d+):", raw)
+        if mm:
+            cur_op_num_arc = mm.group(1)
+        if cur_op_num_arc:
+            mm2 = RE_G23.match(raw)
+            if mm2:
+                I = float(mm2.group(1))
+                J = float(mm2.group(2))
+                r = math.sqrt(I * I + J * J)
+                if r >= 10.0:  # exclude tiny arcs (lead-ins, corner radii)
+                    dia = round(r * 2, 3)
+                    op_arc_dias[cur_op_num_arc][dia] += 1
+
+    # Diameters already captured via explicit OPERATION description
+    already_captured_dias = {h.tool_dia for h in holes if h.cycle == "MILL_CIRCLE"}
+
+    for op in ops_summary:
+        arc_counter = op_arc_dias.get(op["num"], Counter())
+        tool_str = op.get("tool") or ""
+        tool_desc_str = op.get("tool_desc") or ""
+        desc = op.get("desc", "")
+        for dia, cnt in arc_counter.items():
+            if cnt < 2:
+                continue  # single arc = lead-in, not a bore pass
+            # Skip if already covered by an explicit-diameter MILL_CIRCLE entry
+            # for this same operation (avoid double-entry at the same diameter)
+            if any(
+                h.op_num == op["num"] and abs(h.tool_dia - dia) < 0.01
+                for h in holes
+                if h.cycle == "MILL_CIRCLE"
+            ):
+                continue
+            holes.append(NCHole(
+                op_file=op_name, op_num=op["num"], desc=desc,
+                tool=tool_str, tool_desc=tool_desc_str,
+                tool_type="MILL",
+                tool_dia=dia, cycle="MILL_CIRCLE",
+                x=0.0, y=0.0, z=0.0,
+            ))
 
     return holes, ops_summary
 
@@ -666,7 +726,6 @@ def correlate(
         tol_midpoint = (plus_tol - minus_tol) / 2   # offset from nominal
         correction   = tol_midpoint - dev
     """
-    from collections import defaultdict
 
     # ── Pass 1: resolve each diameter feature → best NC tool ─────────────
     # Key: (name, nominal) so that a feature name that appears at multiple

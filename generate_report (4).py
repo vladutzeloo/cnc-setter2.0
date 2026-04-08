@@ -48,6 +48,12 @@ class CMMFeature:
         return "OOT" if self.out_of_tol else "OK"
 
     @property
+    def tol_midpoint(self):
+        """Signed offset from nominal to the centre of the tolerance band.
+        Zero for symmetric tolerances; non-zero when plus_tol ≠ minus_tol."""
+        return round((self.plus_tol - self.minus_tol) / 2, 4)
+
+    @property
     def tol_used_pct(self):
         tol = self.plus_tol if self.dev >= 0 else self.minus_tol
         return round(abs(self.dev) / tol * 100, 1) if tol else 0
@@ -56,7 +62,10 @@ class CMMFeature:
         return {
             "name": self.name, "type": self.feature_type, "axis": self.axis,
             "nominal": self.nominal, "plus_tol": self.plus_tol,
-            "minus_tol": self.minus_tol, "meas": self.meas,
+            "minus_tol": self.minus_tol,
+            "tol_midpoint": self.tol_midpoint,
+            "tol_center": round(self.nominal + self.tol_midpoint, 4),
+            "meas": self.meas,
             "dev": round(self.dev, 4), "outtol": round(self.outtol, 4),
             "out_of_tol": self.out_of_tol, "status": self.status,
             "tol_used_pct": self.tol_used_pct, "page": self.page,
@@ -92,12 +101,15 @@ class OffsetRecommendation:
     n_holes: int = 0
 
     def to_dict(self):
+        f = self.feature
         return {
-            "feature": self.feature.to_dict(),
+            "feature": f.to_dict(),
             "tool": self.tool, "tool_desc": self.tool_desc,
             "op_num": self.op_num, "op_desc": self.op_desc,
             "match_reason": self.match_reason, "direction": self.direction,
             "correction": round(self.correction, 4),
+            "correction_target": round(f.nominal + f.tol_midpoint, 4),
+            "using_midpoint": f.tol_midpoint != 0.0,
             "confidence": self.confidence, "n_holes": self.n_holes,
         }
 
@@ -377,56 +389,109 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
 
 # ─── CORRELATION ENGINE ──────────────────────────────────────────────────────
 
+def _find_dia_match(
+    feat: "CMMFeature",
+    nc_holes: List[NCHole],
+) -> Tuple[Optional[NCHole], str, str]:
+    """Return (best_hole, confidence, reason) for a diameter CMM feature."""
+    # 1. Reamer — tightest fit, highest confidence
+    for h in nc_holes:
+        if h.tool_type == "REAMER" and h.tool_dia > 0:
+            if abs(h.tool_dia - feat.nominal) < 0.15:
+                return h, "HIGH", (
+                    f"Reamer T{h.tool} D{h.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
+                )
+
+    # 2. Drill — loose fit, medium confidence
+    for h in nc_holes:
+        if h.tool_type == "DRILL" and h.tool_dia > 0:
+            if abs(h.tool_dia - feat.nominal) < 0.2:
+                return h, "MEDIUM", (
+                    f"Drill T{h.tool} D{h.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
+                )
+
+    # 3. Boring bar — wider match band for large bores
+    for h in nc_holes:
+        if h.tool_type == "BORE" and h.tool_dia > 0:
+            if abs(h.tool_dia - feat.nominal) < 0.5:
+                return h, "MEDIUM", (
+                    f"Boring bar T{h.tool} D{h.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
+                )
+
+    # 4. No match
+    if feat.nominal > 15:
+        msg = f"Large bore Ø{feat.nominal:.3f}mm — assign manually (milling/boring op)"
+    else:
+        msg = f"No matching tool for Ø{feat.nominal:.3f}mm"
+    return None, "LOW", msg
+
+
 def correlate(
     cmm_features: List[CMMFeature],
     nc_holes: List[NCHole],
 ) -> List[OffsetRecommendation]:
-    """Match CMM features to NC tools and build offset recommendations."""
+    """Match CMM features to NC tools and build offset recommendations.
+
+    Correction is always computed relative to the *centre of the tolerance
+    band*, not to the bare nominal.  For symmetric tolerances this is
+    identical to the classic  correction = -dev  formula.  For asymmetric
+    (bilateral) tolerances the correction steers the dimension to the
+    midpoint of the band, giving maximum margin on both sides.
+
+        tol_midpoint = (plus_tol - minus_tol) / 2   # offset from nominal
+        correction   = tol_midpoint - dev
+    """
+    from collections import defaultdict
+
+    # ── Pass 1: resolve each diameter feature → best NC tool ─────────────
+    # Keyed by feature name so that Z/M/T rows of the *same* feature can
+    # inherit the matched tool without a second diameter search.
+    dia_cache: dict = {}   # name → (NCHole|None, confidence, reason)
+    for feat in cmm_features:
+        if feat.axis == "D" and feat.name not in dia_cache:
+            dia_cache[feat.name] = _find_dia_match(feat, nc_holes)
+
+    # ── Pass 2: build recommendations for every feature with a deviation ──
     recs: List[OffsetRecommendation] = []
 
     for feat in cmm_features:
         if abs(feat.dev) < 0.0001:
             continue
 
+        # Correction targets the tolerance band centre (midpoint).
+        # When plus_tol == minus_tol, tol_midpoint == 0 → same as -dev.
+        tol_midpoint = feat.tol_midpoint
+        correction = tol_midpoint - feat.dev
+
         matched: Optional[NCHole] = None
         reason = ""
         confidence = "LOW"
 
         if feat.axis == "D":
-            # 1. Try reamer first (most precise match)
-            for h in nc_holes:
-                if h.tool_type == "REAMER" and h.tool_dia > 0:
-                    if abs(h.tool_dia - feat.nominal) < 0.15:
-                        matched = h
-                        reason = f"Reamer T{h.tool} D{h.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
-                        confidence = "HIGH"
-                        break
-
-            # 2. Try drill as final operation
-            if not matched:
-                for h in nc_holes:
-                    if h.tool_type == "DRILL" and h.tool_dia > 0:
-                        if abs(h.tool_dia - feat.nominal) < 0.2:
-                            matched = h
-                            reason = f"Drill T{h.tool} D{h.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
-                            confidence = "MEDIUM"
-                            break
-
-            if not matched:
-                if feat.nominal > 15:
-                    reason = f"Large bore Ø{feat.nominal:.3f}mm — assign manually (milling/boring op)"
-                else:
-                    reason = f"No matching tool for Ø{feat.nominal:.3f}mm"
-                confidence = "LOW"
-
+            matched, confidence, reason = dia_cache.get(
+                feat.name, (None, "LOW", f"No matching tool for Ø{feat.nominal:.3f}mm")
+            )
             direction = "RADIAL (diameter)"
-            correction = -feat.dev
+
+        elif feat.axis in ("Z", "M", "T"):
+            direction = "AXIAL"
+            # Inherit the NC operation from the diameter match of this same
+            # feature (e.g. CIR85-D already resolved to a reamer; the CIR85-Z
+            # depth measurement belongs to the same machining step).
+            cached = dia_cache.get(feat.name)
+            if cached and cached[0] is not None:
+                matched, _, _ = cached
+                confidence = "MEDIUM"
+                reason = (
+                    f"{feat.axis}-axis on {feat.feature_type} {feat.name} "
+                    f"linked via diameter match → T{matched.tool}"
+                )
+            else:
+                reason = f"{feat.axis}-axis deviation on {feat.feature_type} {feat.name}"
 
         else:
+            direction = "POSITIONAL"
             reason = f"{feat.axis}-axis deviation on {feat.feature_type} {feat.name}"
-            direction = "AXIAL" if feat.axis in ("Z", "M", "T") else "POSITIONAL"
-            correction = -feat.dev
-            confidence = "LOW"
 
         n_holes = 0
         if matched:
@@ -719,6 +784,12 @@ function rowHtml(r,idx){{
   const devCls = f.dev>=0?'pos':'neg';
   const corrCls = r.correction>0?'up':'down';
   const corrArrow = r.correction>0?'▲':'▼';
+  const midTag = r.using_midpoint
+    ? `<span style="font-family:var(--mono);font-size:9px;color:var(--warn);border:1px solid rgba(255,165,2,.3);padding:1px 4px;border-radius:2px;margin-left:4px">MID</span>`
+    : '';
+  const tolLabel = f.plus_tol===f.minus_tol
+    ? `±${{f.plus_tol.toFixed(3)}}`
+    : `+${{f.plus_tol.toFixed(3)}} / -${{f.minus_tol.toFixed(3)}}`;
   const toolHtml = r.tool==='—'
     ? `<button class="tool-assign-btn" onclick="event.stopPropagation();showToast('Manual assignment — coming soon')">+ Assign tool</button>`
     : `<div class="tool-info"><span class="tool-num">T${{r.tool}}</span><span class="tool-desc-text" title="${{r.tool_desc}}">${{r.tool_desc}}</span></div>`;
@@ -730,8 +801,8 @@ function rowHtml(r,idx){{
       <span style="margin-top:2px"><span class="status-badge ${{f.status}}">${{f.status}}</span></span>
     </div>
     <div class="rec-cell">
-      <span class="val-main">Ø${{f.nominal.toFixed(3)}}</span>
-      <span class="val-sub">+${{f.plus_tol.toFixed(3)}}/${{f.minus_tol.toFixed(3)}}</span>
+      <span class="val-main">${{f.nominal.toFixed(3)}}</span>
+      <span class="val-sub">${{tolLabel}}</span>
     </div>
     <div class="rec-cell">
       <span class="val-main">${{f.meas.toFixed(3)}}</span>
@@ -748,8 +819,8 @@ function rowHtml(r,idx){{
     </div>
     <div class="rec-cell">${{toolHtml}}</div>
     <div class="rec-cell">
-      ${{f.out_of_tol
-        ? `<span class="correction-val ${{corrCls}}">${{corrArrow}} ${{Math.abs(r.correction).toFixed(4)}}</span><span class="val-sub">${{r.direction.split(' ')[0]}}</span>`
+      ${{f.out_of_tol || Math.abs(r.correction)>0.0001
+        ? `<span class="correction-val ${{corrCls}}">${{corrArrow}} ${{Math.abs(r.correction).toFixed(4)}}${{midTag}}</span><span class="val-sub">${{r.direction.split(' ')[0]}}</span>`
         : `<span class="val-sub">—</span>`}}
     </div>
   </div>`;
@@ -772,6 +843,9 @@ function selectRec(idx){{
           <div class="detail-row"><span class="detail-key">Nominal</span><span class="detail-val">${{f.nominal.toFixed(4)}} mm</span></div>
           <div class="detail-row"><span class="detail-key">+Tolerance</span><span class="detail-val">+${{f.plus_tol.toFixed(4)}} mm</span></div>
           <div class="detail-row"><span class="detail-key">−Tolerance</span><span class="detail-val">−${{f.minus_tol.toFixed(4)}} mm</span></div>
+          ${{f.tol_midpoint!==0
+            ? `<div class="detail-row"><span class="detail-key" style="color:var(--warn)">Band centre</span><span class="detail-val" style="color:var(--warn)">${{f.tol_center.toFixed(4)}} mm</span></div>`
+            : ''}}
           <div class="detail-row"><span class="detail-key">Measured</span><span class="detail-val">${{f.meas.toFixed(4)}} mm</span></div>
           <div class="detail-row"><span class="detail-key">Deviation</span>
             <span class="detail-val" style="color:${{f.dev>=0?'var(--ok)':'var(--oot)'}}">${{f.dev>=0?'+':''}}${{f.dev.toFixed(4)}} mm</span></div>
@@ -791,13 +865,18 @@ function selectRec(idx){{
         <div class="detail-group">
           <div class="detail-group-label">Offset Recommendation</div>
           <div class="detail-row"><span class="detail-key">Direction</span><span class="detail-val">${{r.direction}}</span></div>
+          <div class="detail-row"><span class="detail-key">Target</span>
+            <span class="detail-val" style="color:var(--accent)">${{r.correction_target.toFixed(4)}} mm
+              ${{r.using_midpoint?'<span style="font-size:9px;color:var(--warn)">(band centre)</span>':''}}
+            </span>
+          </div>
           <div class="detail-row"><span class="detail-key">Correction</span>
             <span class="detail-val" style="color:${{r.correction>0?'var(--ok)':'var(--oot)'}};font-size:18px;font-weight:700">
               ${{r.correction>0?'▲':'▼'}} ${{Math.abs(r.correction).toFixed(4)}} mm
             </span>
           </div>
           ${{r.n_holes>0
-            ? `<div class="offset-box">Apply wear offset on T${{r.tool}}<br>OP${{r.op_num}}: ${{r.op_desc}}<br>${{r.correction>0?'Increase':'Decrease'}} tool comp by ${{Math.abs(r.correction).toFixed(4)}}mm</div>`
+            ? `<div class="offset-box">Apply wear offset on T${{r.tool}}<br>OP${{r.op_num}}: ${{r.op_desc}}<br>${{r.correction>0?'Increase':'Decrease'}} tool comp by ${{Math.abs(r.correction).toFixed(4)}}mm<br>${{r.using_midpoint?'(correcting to tolerance band centre)':''}}</div>`
             : `<div style="margin-top:10px;font-size:11px;color:var(--dim)">Assign tool manually to generate specific offset instruction.</div>`}}
         </div>
       </div>

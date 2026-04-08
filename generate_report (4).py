@@ -242,41 +242,48 @@ def _compute_outtol(dev: float, plus_tol: float, minus_tol: float) -> float:
 
 def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
     """
-    Parse a Calypso CMM PDF via OCR.
-    Requires: pymupdf (fitz), pytesseract, Pillow, tesseract-ocr installed.
+    Parse a Calypso CMM PDF.
+
+    Extraction strategy (tried in order for each page):
+      1. Direct text extraction via PyMuPDF (fast, reliable for vector PDFs
+         — the typical Calypso "Print to PDF" output).
+      2. OCR via Tesseract on any embedded raster images (fallback for
+         scanned / image-based PDFs).
+
+    Requires: pymupdf (fitz); for OCR fallback also pytesseract + Pillow +
+    tesseract-ocr.
     """
     try:
         import fitz
+    except ImportError:
+        print("[ERROR] pymupdf not installed.  Run: pip install pymupdf")
+        sys.exit(1)
+
+    # pytesseract and Pillow are only needed for the OCR fallback path.
+    # We import them lazily below so the tool works without them when the
+    # PDF has selectable text (the common Calypso case).
+    try:
         import pytesseract
         from PIL import Image
         import io
-    except ImportError as e:
-        print(f"[ERROR] Missing dependency: {e}")
-        print("  Run: pip install pymupdf pytesseract pillow tqdm")
-        print("  And: apt install tesseract-ocr  (or brew install tesseract)")
-        sys.exit(1)
+        _ocr_available = True
+    except ImportError:
+        pytesseract = None          # type: ignore[assignment]
+        Image = None                # type: ignore[assignment]
+        io = None                   # type: ignore[assignment]
+        _ocr_available = False
 
-    # Windows: point pytesseract at the default Tesseract install location
-    # if it isn't already on PATH
-    if sys.platform == "win32" and not pytesseract.get_tesseract_version.__module__:
-        pass  # already configured
-    if sys.platform == "win32":
+    # Windows: if OCR is available but tesseract isn't on PATH, find it.
+    if _ocr_available and sys.platform == "win32":
         import shutil
         if not shutil.which("tesseract"):
-            # Try the two most common Windows install paths
-            _candidates = [
+            for _path in [
                 r"C:\Program Files\Tesseract-OCR\tesseract.exe",
                 r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            ]
-            for _path in _candidates:
+            ]:
                 if os.path.isfile(_path):
                     pytesseract.pytesseract.tesseract_cmd = _path
                     break
-            else:
-                print("[ERROR] Tesseract not found. Download and install from:")
-                print("  https://github.com/UB-Mannheim/tesseract/wiki")
-                print("  Then re-run the script.")
-                sys.exit(1)
 
     try:
         from tqdm import tqdm
@@ -296,41 +303,96 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
             page_iter = tqdm(
                 page_iter,
                 total=total_pages,
-                desc="  OCR",
+                desc="  Parse",
                 unit="pg",
                 bar_format=(
-                    "  OCR [{bar:30}] {n_fmt}/{total_fmt} pages  "
+                    "  Parse [{bar:30}] {n_fmt}/{total_fmt} pages  "
                     "({elapsed} elapsed, ~{remaining} left)"
                 ),
                 ncols=72,
             )
         else:
-            print(f"  OCR: 0/{total_pages} pages", end="\r", flush=True)
+            print(f"  Parse: 0/{total_pages} pages", end="\r", flush=True)
 
     for page_num in page_iter:
         if verbose and not tqdm:
-            print(f"  OCR: {page_num + 1}/{total_pages} pages", end="\r", flush=True)
+            print(f"  Parse: {page_num + 1}/{total_pages} pages", end="\r", flush=True)
 
         page = doc[page_num]
-        for img_info in page.get_images(full=True):
-            xref = img_info[0]
-            base_image = doc.extract_image(xref)
-            img = Image.open(io.BytesIO(base_image["image"]))
 
-            # Resize for speed while keeping OCR accuracy
-            w, h = img.size
-            if w > 1200:
-                scale = 1200 / w
-                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        # ── Collect text-line sources for this page ───────────────────────
+        # Strategy: try direct vector-text extraction first (Calypso normally
+        # produces a selectable-text PDF, not an image PDF).  Fall back to
+        # per-image OCR only when the page has no extractable text (scanned /
+        # pure-image PDF).
+        page_sources: List[List[str]] = []
 
-            text = pytesseract.image_to_string(img, config="--psm 6 --oem 3")
+        # -- Direct text extraction (vector PDF) -------------------------
+        try:
+            raw = page.get_text("rawdict", flags=0)
+            words = []
+            for blk in raw.get("blocks", []):
+                if blk.get("type") != 0:          # skip image blocks
+                    continue
+                for ln in blk.get("lines", []):
+                    for span in ln.get("spans", []):
+                        txt = span.get("text", "").strip()
+                        if not txt:
+                            continue
+                        bbox = span.get("bbox", [0, 0, 0, 0])
+                        y_mid = (bbox[1] + bbox[3]) / 2
+                        page_sources  # ensure closure captures outer list
+                        words.append((y_mid, bbox[0], txt))
+            if len(words) > 8:
+                # Group words by Y position (within 4 pt) to reconstruct rows.
+                words.sort(key=lambda w: (w[0], w[1]))
+                rows: List[str] = []
+                cur_y: Optional[float] = None
+                cur_row: List[Tuple[float, str]] = []
+                for y, x, txt in words:
+                    if cur_y is None or abs(y - cur_y) <= 4.0:
+                        cur_row.append((x, txt))
+                        if cur_y is None:
+                            cur_y = y
+                    else:
+                        cur_row.sort(key=lambda w: w[0])
+                        rows.append(" ".join(t for _, t in cur_row))
+                        cur_row = [(x, txt)]
+                        cur_y = y
+                if cur_row:
+                    cur_row.sort(key=lambda w: w[0])
+                    rows.append(" ".join(t for _, t in cur_row))
+                direct_lines = [r.strip() for r in rows if r.strip()]
+                if direct_lines:
+                    page_sources.append(direct_lines)
+        except Exception:
+            pass
 
-            # Split once; we make two passes over the lines.
-            img_lines = [ln.strip() for ln in text.split("\n")]
+        # -- OCR fallback (image-based / scanned PDF) --------------------
+        if not page_sources and _ocr_available:
+            for img_info in page.get_images(full=True):
+                try:
+                    xref = img_info[0]
+                    base_image = doc.extract_image(xref)
+                    img = Image.open(io.BytesIO(base_image["image"]))
+                    w, h = img.size
+                    if w > 1200:
+                        scale = 1200 / w
+                        img = img.resize((int(w * scale), int(h * scale)),
+                                         Image.LANCZOS)
+                    text = pytesseract.image_to_string(img,
+                                                       config="--psm 6 --oem 3")
+                    ocr_lines = [ln.strip() for ln in text.split("\n")]
+                    page_sources.append(ocr_lines)
+                except Exception:
+                    pass
 
-            # ── Pass 1: locate every feature-name declaration in this image ──
+        # ── Two-pass processing — identical for both direct and OCR lines ─
+        for img_lines in page_sources:
+
+            # ── Pass 1: locate every feature-name declaration in this block ──
             # Stores (line_index, name, type) so that D/axis rows can look up
-            # the *nearest preceding* name in the same image instead of relying
+            # the *nearest preceding* name in the same block instead of relying
             # on cur_name which may come from the previous image.
             img_name_locs: List[Tuple[int, str, str]] = []
             for i, line in enumerate(img_lines):
@@ -339,11 +401,11 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                 # Explicit header: "9 - CIR84", "KEY5 - CYL F"
                 m = RE_FEAT_HEADER.search(line)
                 if m:
-                    raw = m.group(1)
-                    type_m = re.search(r"(CIR|PLN|CYL|LIN|PNT|SET)", raw, re.I)
+                    raw2 = m.group(1)
+                    type_m = re.search(r"(CIR|PLN|CYL|LIN|PNT|SET)", raw2, re.I)
                     if type_m:
                         ftype = type_m.group(1).upper()
-                        after = raw.split("-")[-1].strip()
+                        after = raw2.split("-")[-1].strip()
                         name_m = RE_FEAT_NAME.search(after)
                         fname = (
                             name_m.group(1).upper() + name_m.group(2).upper()
@@ -364,14 +426,14 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                             m2.group(1).upper(),
                         ))
 
-            # After processing this image, advance the global cursors so the
-            # *next* image can fall back to the last name seen here.
+            # After processing this block, advance the global cursors so the
+            # *next* block can fall back to the last name seen here.
             if img_name_locs:
                 _, cur_name, cur_type = img_name_locs[-1]
 
             def nearest_img_name(line_idx: int) -> Tuple[Optional[str], Optional[str]]:
                 """(name, type) of the closest preceding name declaration in
-                this image; falls forward if nothing precedes the row."""
+                this block; falls forward if nothing precedes the row."""
                 for li, name, typ in reversed(img_name_locs):
                     if li <= line_idx:
                         return name, typ
@@ -408,7 +470,7 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                                 page=page_num + 1,
                             ))
                             # The embedded name also becomes the context for
-                            # any following D/axis rows in this image.
+                            # any following D/axis rows in this block.
                             cur_name = fname
                             cur_type = type_m.group(1).upper()
                         except ValueError:
@@ -783,9 +845,7 @@ header{{display:flex;align-items:center;justify-content:space-between;padding:0 
           <span style="background:rgba(0,212,255,.15);color:var(--accent);padding:1px 5px;border-radius:2px;font-size:9px">CMM</span>
           {cmm_filename}
         </div>
-        {''.join(f"""<div style="font-family:var(--mono);font-size:10px;display:flex;align-items:center;gap:6px">
-          <span style="background:rgba(0,200,122,.15);color:var(--ok);padding:1px 5px;border-radius:2px;font-size:9px">NC</span>
-          {f}</div>""" for f in nc_filenames)}
+        {''.join('<div style="font-family:var(--mono);font-size:10px;display:flex;align-items:center;gap:6px"><span style="background:rgba(0,200,122,.15);color:var(--ok);padding:1px 5px;border-radius:2px;font-size:9px">NC</span> ' + nc + '</div>' for nc in nc_filenames)}
       </div>
     </div>
   </aside>

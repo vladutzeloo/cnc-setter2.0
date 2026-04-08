@@ -17,9 +17,11 @@ Dependencies:
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -38,6 +40,7 @@ class CMMFeature:
     dev: float
     outtol: float
     page: int
+    suspect: bool = False   # True when OCR value is physically implausible
 
     @property
     def out_of_tol(self):
@@ -45,6 +48,8 @@ class CMMFeature:
 
     @property
     def status(self):
+        if self.suspect:
+            return "SUSPECT"
         return "OOT" if self.out_of_tol else "OK"
 
     @property
@@ -68,7 +73,8 @@ class CMMFeature:
             "meas": self.meas,
             "dev": round(self.dev, 4), "outtol": round(self.outtol, 4),
             "out_of_tol": self.out_of_tol, "status": self.status,
-            "tol_used_pct": self.tol_used_pct, "page": self.page,
+            "suspect": self.suspect, "tol_used_pct": self.tol_used_pct,
+            "page": self.page,
         }
 
 
@@ -146,14 +152,36 @@ CANNED_CYCLE = re.compile(
 CONTINUATION = re.compile(r"^X([\d\.-]+)\s+Y([\d\.-]+)$")
 
 
+_RE_OP_DIA   = re.compile(r'\bD(\d+\.?\d*)\b')
+_RE_OP_TOOL  = re.compile(r'\bT(\w+)\b')
+_SKIP_OP_KWS = ("DRILL", "REAM", "CHAMFER", "THREAD", "PECKING", "PILOT",
+                 "SPOT", "CENTER")
+
+
 def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
-    """Parse a single NC file. Returns (holes, ops_summary)."""
+    """Parse a single NC file. Returns (holes, ops_summary).
+
+    In addition to canned-cycle holes (G83/G85), also creates virtual
+    MILL_CIRCLE entries for milling operations whose OPERATION comment
+    contains an explicit machined diameter (e.g. "T197 D158.4 FINISH").
+    These are used to match large-bore CMM features that are machined
+    by circular interpolation rather than canned cycles.
+    """
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.read().splitlines()
 
     op_name = Path(filepath).stem
     holes: List[NCHole] = []
     ops_summary: List[dict] = []
+
+    # Build tool registry from all TOOL comments (they appear at file top).
+    # This avoids the stale cur_tool_desc bug where only the last TOOL comment
+    # was remembered by the time each OPERATION comment was encountered.
+    tool_registry: dict = {}   # tool_num → tool_desc
+    for raw in lines:
+        tm = re.match(r"\(\s*TOOL\s+(\S+):\s+(.+?)\s*\)", raw.strip())
+        if tm:
+            tool_registry[tm.group(1)] = tm.group(2).strip()
 
     cur_tool = None
     cur_tool_desc = None
@@ -166,6 +194,8 @@ def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
         m = re.match(r"T(\w+)\s+M6", line)
         if m:
             cur_tool = m.group(1)
+            # Update cur_tool_desc from registry on tool change
+            cur_tool_desc = tool_registry.get(cur_tool, cur_tool_desc)
 
         m = re.match(r"\(\s*TOOL\s+\S+:\s+(.+?)\s*\)", line)
         if m:
@@ -173,9 +203,14 @@ def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
 
         m = re.match(r"\(\s*OPERATION\s+(\d+):\s+(.+?)\s*\)", line)
         if m:
+            op_desc = m.group(2)
+            # Resolve tool desc: try tool embedded in operation description
+            mt = _RE_OP_TOOL.search(op_desc)
+            op_tool = mt.group(1) if mt else cur_tool
+            op_tool_desc = tool_registry.get(op_tool or "", "") or cur_tool_desc or ""
             cur_op = {
-                "num": m.group(1), "desc": m.group(2),
-                "tool": cur_tool, "tool_desc": cur_tool_desc, "n_holes": 0,
+                "num": m.group(1), "desc": op_desc,
+                "tool": op_tool, "tool_desc": op_tool_desc, "n_holes": 0,
             }
             ops_summary.append(cur_op)
 
@@ -207,6 +242,90 @@ def parse_nc_file(filepath: str) -> Tuple[List[NCHole], List[dict]]:
             cur_op["n_holes"] += 1
             last_hole = h
 
+    # ── Circular milling ops: create virtual MILL_CIRCLE entries ─────────
+    # HyperMill sometimes encodes the machined bore diameter directly in the
+    # OPERATION comment, e.g. "T197 D158.4 FINISH".  Capture these so the
+    # correlation engine can match them to large-bore CMM circle features.
+    for op in ops_summary:
+        desc = op.get("desc", "")
+        m_dia = _RE_OP_DIA.search(desc)
+        if not m_dia:
+            continue
+        machined_dia = float(m_dia.group(1))
+        if machined_dia <= 0:
+            continue
+        # Skip operations already covered by canned cycles (drill/ream/etc.)
+        desc_upper = desc.upper()
+        if any(kw in desc_upper for kw in _SKIP_OP_KWS):
+            continue
+        tool_str = op.get("tool") or ""
+        tool_desc_str = op.get("tool_desc") or ""
+        holes.append(NCHole(
+            op_file=op_name, op_num=op["num"], desc=desc,
+            tool=tool_str, tool_desc=tool_desc_str,
+            tool_type="MILL",
+            tool_dia=machined_dia, cycle="MILL_CIRCLE",
+            x=0.0, y=0.0, z=0.0,
+        ))
+
+    # ── Circular milling from G3/G2 arc radii ────────────────────────────
+    # When G41/G42 cutter compensation is active (standard in HyperMill),
+    # the programmed G3/G2 arc radius equals the bore radius of the machined
+    # circle.  Machined diameter = 2 × arc radius.
+    #
+    # Strategy: for each operation, count how many times each arc radius
+    # appears.  A radius that appears ≥2 times is a bore pass (helical
+    # milling repeats the same radius many times); a one-off arc is just a
+    # lead-in or corner.  Skip radii < 10mm (they're contour corners, not
+    # bores we would measure with CMM).
+    RE_G23 = re.compile(
+        r"^G[23]\s+.*?I\s*([-\d.]+)\s+J\s*([-\d.]+)", re.IGNORECASE
+    )
+    # Collect arc diameters per operation
+    op_arc_dias: dict = {op["num"]: Counter() for op in ops_summary}
+    cur_op_num_arc = None
+    for raw in lines:
+        raw = raw.strip()
+        mm = re.match(r"\(\s*OPERATION\s+(\d+):", raw)
+        if mm:
+            cur_op_num_arc = mm.group(1)
+        if cur_op_num_arc:
+            mm2 = RE_G23.match(raw)
+            if mm2:
+                I = float(mm2.group(1))
+                J = float(mm2.group(2))
+                r = math.sqrt(I * I + J * J)
+                if r >= 10.0:  # exclude tiny arcs (lead-ins, corner radii)
+                    dia = round(r * 2, 3)
+                    op_arc_dias[cur_op_num_arc][dia] += 1
+
+    # Diameters already captured via explicit OPERATION description
+    already_captured_dias = {h.tool_dia for h in holes if h.cycle == "MILL_CIRCLE"}
+
+    for op in ops_summary:
+        arc_counter = op_arc_dias.get(op["num"], Counter())
+        tool_str = op.get("tool") or ""
+        tool_desc_str = op.get("tool_desc") or ""
+        desc = op.get("desc", "")
+        for dia, cnt in arc_counter.items():
+            if cnt < 2:
+                continue  # single arc = lead-in, not a bore pass
+            # Skip if already covered by an explicit-diameter MILL_CIRCLE entry
+            # for this same operation (avoid double-entry at the same diameter)
+            if any(
+                h.op_num == op["num"] and abs(h.tool_dia - dia) < 0.01
+                for h in holes
+                if h.cycle == "MILL_CIRCLE"
+            ):
+                continue
+            holes.append(NCHole(
+                op_file=op_name, op_num=op["num"], desc=desc,
+                tool=tool_str, tool_desc=tool_desc_str,
+                tool_type="MILL",
+                tool_dia=dia, cycle="MILL_CIRCLE",
+                x=0.0, y=0.0, z=0.0,
+            ))
+
     return holes, ops_summary
 
 
@@ -228,6 +347,39 @@ RE_FEAT_HEADER = re.compile(
     r"(?:^|\s)(\d+\s*[-–]\s*(CIR|PLN|CYL|LIN|PNT|SET)\s*[A-Z0-9]*)", re.IGNORECASE
 )
 RE_FEAT_NAME = re.compile(r"\b(CIR|PLN|CYL|LIN|PNT|SET)\s*([A-Z0-9]+)\b", re.IGNORECASE)
+
+
+def _sanitize_meas(
+    nominal: float, meas: float, plus_tol: float, minus_tol: float
+) -> Tuple[float, float, bool]:
+    """Return (fixed_meas, dev, suspect).
+
+    Two OCR artefacts are corrected here:
+
+    1. Sign-flip: Tesseract sometimes drops the minus sign from a negative
+       measurement value.  If nominal < 0 and the raw meas is positive with
+       a magnitude close to |nominal|, the sign was likely dropped.
+       Example: nominal=-2.200, OCR meas=+2.212 → fixed meas=-2.212, dev=-0.012
+
+    2. Impossible deviation: |dev| >> tolerance band by ×100 or ≥50mm means
+       the OCR picked up a page number or an adjacent column value.
+       The feature is kept but flagged as suspect so the HTML can warn the user.
+    """
+    tol_band = plus_tol + minus_tol
+
+    # --- Sign-flip correction -----------------------------------------------
+    if nominal < -1e-6 and meas > 1e-6:
+        # How close is |meas| to |nominal|?  Within 3× tolerance band is safe.
+        if abs(meas + nominal) <= max(tol_band * 3, 0.5):
+            meas = -meas
+
+    dev = round(meas - nominal, 6)
+
+    # --- Implausibility check ------------------------------------------------
+    max_reasonable = max(tol_band * 100, 50.0)
+    suspect = abs(dev) > max_reasonable
+
+    return meas, dev, suspect
 
 
 def _compute_outtol(dev: float, plus_tol: float, minus_tol: float) -> float:
@@ -460,14 +612,14 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                             nominal = float(m.group(1))
                             plus_t  = float(m.group(2))
                             minus_t = float(m.group(3))
-                            meas    = float(m.group(4))
-                            dev     = round(meas - nominal, 6)
+                            meas, dev, susp = _sanitize_meas(
+                                nominal, float(m.group(4)), plus_t, minus_t)
                             features.append(CMMFeature(
                                 name=name, feature_type=ftype, axis="D",
                                 nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
                                 meas=meas, dev=dev,
                                 outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
+                                page=page_num + 1, suspect=susp,
                             ))
                         except ValueError:
                             pass
@@ -486,14 +638,14 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                             nominal = float(m.group(2))
                             plus_t  = float(m.group(3))
                             minus_t = float(m.group(4))
-                            meas    = float(m.group(5))
-                            dev     = round(meas - nominal, 6)
+                            meas, dev, susp = _sanitize_meas(
+                                nominal, float(m.group(5)), plus_t, minus_t)
                             features.append(CMMFeature(
                                 name=name, feature_type=ftype, axis=m.group(1),
                                 nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
                                 meas=meas, dev=dev,
                                 outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
+                                page=page_num + 1, suspect=susp,
                             ))
                         except ValueError:
                             pass
@@ -510,15 +662,15 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                             nominal = float(m.group(2))
                             plus_t  = float(m.group(3))
                             minus_t = float(m.group(4)) if m.group(4) else plus_t
-                            meas    = float(m.group(5))
-                            dev     = round(meas - nominal, 6)   # computed, not OCR
+                            meas, dev, susp = _sanitize_meas(
+                                nominal, float(m.group(5)), plus_t, minus_t)
                             features.append(CMMFeature(
                                 name=fname, feature_type=type_m.group(1).upper(),
                                 axis="F",
                                 nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
                                 meas=meas, dev=dev,
                                 outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
+                                page=page_num + 1, suspect=susp,
                             ))
                             # The embedded name also becomes the context for
                             # any following D/axis rows in this block.
@@ -565,7 +717,30 @@ def _find_dia_match(
                     f"Boring bar T{h.tool} D{h.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
                 )
 
-    # 4. No match
+    # 4. Circular milling op — diameter encoded in operation description
+    #    (HyperMill writes e.g. "T197 D158.4 FINISH" for a bore pass)
+    best_mill: Optional[NCHole] = None
+    best_mill_diff = float("inf")
+    for h in nc_holes:
+        if h.cycle == "MILL_CIRCLE" and h.tool_dia > 0:
+            diff = abs(h.tool_dia - feat.nominal)
+            if diff < best_mill_diff:
+                best_mill_diff = diff
+                best_mill = h
+    if best_mill is not None:
+        if best_mill_diff < 0.5:
+            return best_mill, "HIGH", (
+                f"Circular mill T{best_mill.tool} machined "
+                f"Ø{best_mill.tool_dia:.3f}mm → nominal Ø{feat.nominal:.3f}mm"
+            )
+        if best_mill_diff < 3.0:
+            return best_mill, "MEDIUM", (
+                f"Nearest circular mill T{best_mill.tool} "
+                f"Ø{best_mill.tool_dia:.3f}mm (Δ{best_mill_diff:.2f}mm) "
+                f"→ nominal Ø{feat.nominal:.3f}mm"
+            )
+
+    # 5. No match
     if feat.nominal > 15:
         msg = f"Large bore Ø{feat.nominal:.3f}mm — assign manually (milling/boring op)"
     else:
@@ -588,15 +763,25 @@ def correlate(
         tol_midpoint = (plus_tol - minus_tol) / 2   # offset from nominal
         correction   = tol_midpoint - dev
     """
-    from collections import defaultdict
 
     # ── Pass 1: resolve each diameter feature → best NC tool ─────────────
-    # Keyed by feature name so that Z/M/T rows of the *same* feature can
-    # inherit the matched tool without a second diameter search.
-    dia_cache: dict = {}   # name → (NCHole|None, confidence, reason)
+    # Key: (name, nominal) so that a feature name that appears at multiple
+    # diameters (e.g. CIR78 at Ø158.4 AND Ø182.0) each gets its own match.
+    dia_cache: dict = {}   # (name, nominal) → (NCHole|None, confidence, reason)
     for feat in cmm_features:
-        if feat.axis == "D" and feat.name not in dia_cache:
-            dia_cache[feat.name] = _find_dia_match(feat, nc_holes)
+        key = (feat.name, feat.nominal)
+        if feat.axis == "D" and key not in dia_cache:
+            dia_cache[key] = _find_dia_match(feat, nc_holes)
+
+    def _best_dia_for_name(name: str):
+        """Return the best (hole, confidence, reason) cached for any nominal
+        of *name*, preferring HIGH > MEDIUM > LOW, then smallest LOW nominal."""
+        candidates = [v for (n, _), v in dia_cache.items() if n == name]
+        if not candidates:
+            return None, "LOW", ""
+        order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        candidates.sort(key=lambda v: order.get(v[1], 9))
+        return candidates[0]
 
     # ── Pass 2: build recommendations for every feature with a deviation ──
     recs: List[OffsetRecommendation] = []
@@ -604,6 +789,8 @@ def correlate(
     for feat in cmm_features:
         if abs(feat.dev) < 0.0001:
             continue
+        if feat.suspect:
+            continue  # OCR artefact — no recommendation
 
         # Correction targets the tolerance band centre (midpoint).
         # When plus_tol == minus_tol, tol_midpoint == 0 → same as -dev.
@@ -616,18 +803,18 @@ def correlate(
 
         if feat.axis == "D":
             matched, confidence, reason = dia_cache.get(
-                feat.name, (None, "LOW", f"No matching tool for Ø{feat.nominal:.3f}mm")
+                (feat.name, feat.nominal),
+                (None, "LOW", f"No matching tool for Ø{feat.nominal:.3f}mm"),
             )
             direction = "RADIAL (diameter)"
 
         elif feat.axis in ("Z", "M", "T"):
             direction = "AXIAL"
-            # Inherit the NC operation from the diameter match of this same
-            # feature (e.g. CIR85-D already resolved to a reamer; the CIR85-Z
-            # depth measurement belongs to the same machining step).
-            cached = dia_cache.get(feat.name)
-            if cached and cached[0] is not None:
-                matched, _, _ = cached
+            # Inherit the NC operation from the best diameter match for this
+            # feature name.  Works even when multiple bores share a name.
+            cached_hole, cached_conf, _ = _best_dia_for_name(feat.name)
+            if cached_hole is not None:
+                matched = cached_hole
                 confidence = "MEDIUM"
                 reason = (
                     f"{feat.axis}-axis on {feat.feature_type} {feat.name} "
@@ -1369,10 +1556,12 @@ Examples:
 
     t0 = time.time()
     cmm_features = parse_cmm_pdf(cmm_path, verbose=True)
-    oot = [f for f in cmm_features if f.out_of_tol]
+    oot     = [f for f in cmm_features if f.out_of_tol and not f.suspect]
+    suspect = [f for f in cmm_features if f.suspect]
 
+    susp_str = f", {len(suspect)} SUSPECT" if suspect else ""
     done(f"{len(cmm_features)} features parsed  "
-         f"({len(oot)} OOT, {len(cmm_features)-len(oot)} OK)  "
+         f"({len(oot)} OOT, {len(cmm_features)-len(oot)-len(suspect)} OK{susp_str})  "
          f"({time.time()-t0:.0f}s)")
 
     # ── 3. Correlate ─────────────────────────────────────────

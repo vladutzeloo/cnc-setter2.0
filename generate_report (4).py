@@ -448,8 +448,59 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                 if not line:
                     continue
 
-                # Full feature row (name embedded):
-                # "CIR85 0.000 0.030 0.032 0.032 0.002 0.000"
+                # Diameter row (check BEFORE RE_DATA_ROW — "D" is also matched
+                # by the generic pattern): "D 152.400 0.075 0.060 152.384 ..."
+                m = RE_DIAM_ROW.match(line)
+                if m:
+                    local_name, local_type = nearest_img_name(i)
+                    name  = local_name or cur_name
+                    ftype = local_type or cur_type or "CIR"
+                    if name:
+                        try:
+                            nominal = float(m.group(1))
+                            plus_t  = float(m.group(2))
+                            minus_t = float(m.group(3))
+                            meas    = float(m.group(4))
+                            dev     = round(meas - nominal, 6)
+                            features.append(CMMFeature(
+                                name=name, feature_type=ftype, axis="D",
+                                nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
+                                meas=meas, dev=dev,
+                                outtol=_compute_outtol(dev, plus_t, minus_t),
+                                page=page_num + 1,
+                            ))
+                        except ValueError:
+                            pass
+                    continue
+
+                # Axis row (check BEFORE RE_DATA_ROW — single letters like
+                # M/Y/Z/T are also caught by the generic pattern):
+                # "M 11.900 0.030 0.030 11.520 -0.380 0.350"
+                m = RE_AXIS_ROW.match(line)
+                if m:
+                    local_name, local_type = nearest_img_name(i)
+                    name  = local_name or cur_name
+                    ftype = local_type or cur_type or "LIN"
+                    if name:
+                        try:
+                            nominal = float(m.group(2))
+                            plus_t  = float(m.group(3))
+                            minus_t = float(m.group(4))
+                            meas    = float(m.group(5))
+                            dev     = round(meas - nominal, 6)
+                            features.append(CMMFeature(
+                                name=name, feature_type=ftype, axis=m.group(1),
+                                nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
+                                meas=meas, dev=dev,
+                                outtol=_compute_outtol(dev, plus_t, minus_t),
+                                page=page_num + 1,
+                            ))
+                        except ValueError:
+                            pass
+                    continue
+
+                # Full feature row (name embedded) — fallback after specific
+                # D/axis checks: "CIR85 0.000 0.030 0.032 0.032 0.002 0.000"
                 m = RE_DATA_ROW.match(line)
                 if m:
                     fname = m.group(1).replace(" ", "").upper()
@@ -476,53 +527,6 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
                         except ValueError:
                             pass
                     continue
-
-                # Diameter row: "D 152.400 0.075 0.060 152.384 -0.016 0.076"
-                m = RE_DIAM_ROW.match(line)
-                if m:
-                    local_name, local_type = nearest_img_name(i)
-                    name  = local_name or cur_name
-                    ftype = local_type or cur_type or "CIR"
-                    if name:
-                        try:
-                            nominal = float(m.group(1))
-                            plus_t  = float(m.group(2))
-                            minus_t = float(m.group(3))
-                            meas    = float(m.group(4))
-                            dev     = round(meas - nominal, 6)
-                            features.append(CMMFeature(
-                                name=name, feature_type=ftype, axis="D",
-                                nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
-                                meas=meas, dev=dev,
-                                outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
-                            ))
-                        except ValueError:
-                            pass
-                    continue
-
-                # Axis row: "M 11.900 0.030 0.030 11.520 -0.380 0.350"
-                m = RE_AXIS_ROW.match(line)
-                if m:
-                    local_name, local_type = nearest_img_name(i)
-                    name  = local_name or cur_name
-                    ftype = local_type or cur_type or "LIN"
-                    if name:
-                        try:
-                            nominal = float(m.group(2))
-                            plus_t  = float(m.group(3))
-                            minus_t = float(m.group(4))
-                            meas    = float(m.group(5))
-                            dev     = round(meas - nominal, 6)
-                            features.append(CMMFeature(
-                                name=name, feature_type=ftype, axis=m.group(1),
-                                nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
-                                meas=meas, dev=dev,
-                                outtol=_compute_outtol(dev, plus_t, minus_t),
-                                page=page_num + 1,
-                            ))
-                        except ValueError:
-                            pass
 
     if verbose and not tqdm:
         print()  # newline after fallback progress line

@@ -230,6 +230,16 @@ RE_FEAT_HEADER = re.compile(
 RE_FEAT_NAME = re.compile(r"\b(CIR|PLN|CYL|LIN|PNT|SET)\s*([A-Z0-9]+)\b", re.IGNORECASE)
 
 
+def _compute_outtol(dev: float, plus_tol: float, minus_tol: float) -> float:
+    """Return the out-of-tolerance amount (≥0) computed purely from the
+    deviation and tolerance values, independent of the OCR'd outtol column."""
+    if dev > plus_tol + 1e-9:
+        return round(dev - plus_tol, 6)
+    if dev < -(minus_tol + 1e-9):
+        return round(-dev - minus_tol, 6)
+    return 0.0
+
+
 def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
     """
     Parse a Calypso CMM PDF via OCR.
@@ -315,71 +325,142 @@ def parse_cmm_pdf(filepath: str, verbose: bool = False) -> List[CMMFeature]:
 
             text = pytesseract.image_to_string(img, config="--psm 6 --oem 3")
 
-            for line in text.split("\n"):
-                line = line.strip()
+            # Split once; we make two passes over the lines.
+            img_lines = [ln.strip() for ln in text.split("\n")]
+
+            # ── Pass 1: locate every feature-name declaration in this image ──
+            # Stores (line_index, name, type) so that D/axis rows can look up
+            # the *nearest preceding* name in the same image instead of relying
+            # on cur_name which may come from the previous image.
+            img_name_locs: List[Tuple[int, str, str]] = []
+            for i, line in enumerate(img_lines):
                 if not line:
                     continue
-
-                # Feature header detection e.g. "11 - CIR83", "KEY5 - CYL F"
+                # Explicit header: "9 - CIR84", "KEY5 - CYL F"
                 m = RE_FEAT_HEADER.search(line)
                 if m:
                     raw = m.group(1)
                     type_m = re.search(r"(CIR|PLN|CYL|LIN|PNT|SET)", raw, re.I)
                     if type_m:
-                        cur_type = type_m.group(1).upper()
+                        ftype = type_m.group(1).upper()
                         after = raw.split("-")[-1].strip()
                         name_m = RE_FEAT_NAME.search(after)
-                        if name_m:
-                            cur_name = name_m.group(1).upper() + name_m.group(2).upper()
-                        else:
-                            cur_name = re.sub(r"[^A-Z0-9]", "", after.upper()) or cur_type
+                        fname = (
+                            name_m.group(1).upper() + name_m.group(2).upper()
+                            if name_m
+                            else re.sub(r"[^A-Z0-9]", "", after.upper()) or ftype
+                        )
+                        img_name_locs.append((i, fname, ftype))
+                    continue
+                # Inline name on a non-data line: "CIR84" or "CIR 84" alone
+                if (not RE_DIAM_ROW.match(line)
+                        and not RE_AXIS_ROW.match(line)
+                        and not RE_DATA_ROW.match(line)):
+                    m2 = RE_FEAT_NAME.search(line)
+                    if m2:
+                        img_name_locs.append((
+                            i,
+                            m2.group(1).upper() + m2.group(2).upper(),
+                            m2.group(1).upper(),
+                        ))
 
-                # Feature row: "CIR85 0.000 0.030 0.032 0.032 0.002 0.000"
+            # After processing this image, advance the global cursors so the
+            # *next* image can fall back to the last name seen here.
+            if img_name_locs:
+                _, cur_name, cur_type = img_name_locs[-1]
+
+            def nearest_img_name(line_idx: int) -> Tuple[Optional[str], Optional[str]]:
+                """(name, type) of the closest preceding name declaration in
+                this image; falls forward if nothing precedes the row."""
+                for li, name, typ in reversed(img_name_locs):
+                    if li <= line_idx:
+                        return name, typ
+                # Nothing before this line — try the first one after
+                for li, name, typ in img_name_locs:
+                    if li > line_idx:
+                        return name, typ
+                return None, None
+
+            # ── Pass 2: extract measurement rows ─────────────────────────────
+            for i, line in enumerate(img_lines):
+                if not line:
+                    continue
+
+                # Full feature row (name embedded):
+                # "CIR85 0.000 0.030 0.032 0.032 0.002 0.000"
                 m = RE_DATA_ROW.match(line)
                 if m:
                     fname = m.group(1).replace(" ", "").upper()
                     type_m = re.match(r"(CIR|PLN|CYL|LIN|PNT|SET)", fname, re.I)
                     if type_m:
                         try:
+                            nominal = float(m.group(2))
+                            plus_t  = float(m.group(3))
+                            minus_t = float(m.group(4)) if m.group(4) else plus_t
+                            meas    = float(m.group(5))
+                            dev     = round(meas - nominal, 6)   # computed, not OCR
                             features.append(CMMFeature(
-                                name=fname, feature_type=type_m.group(1).upper(), axis="F",
-                                nominal=float(m.group(2)), plus_tol=float(m.group(3)),
-                                minus_tol=float(m.group(4)) if m.group(4) else float(m.group(3)),
-                                meas=float(m.group(5)), dev=float(m.group(6)),
-                                outtol=float(m.group(7)), page=page_num + 1,
+                                name=fname, feature_type=type_m.group(1).upper(),
+                                axis="F",
+                                nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
+                                meas=meas, dev=dev,
+                                outtol=_compute_outtol(dev, plus_t, minus_t),
+                                page=page_num + 1,
                             ))
+                            # The embedded name also becomes the context for
+                            # any following D/axis rows in this image.
+                            cur_name = fname
+                            cur_type = type_m.group(1).upper()
                         except ValueError:
                             pass
                     continue
 
                 # Diameter row: "D 152.400 0.075 0.060 152.384 -0.016 0.076"
                 m = RE_DIAM_ROW.match(line)
-                if m and cur_name:
-                    try:
-                        features.append(CMMFeature(
-                            name=cur_name, feature_type=cur_type or "CIR", axis="D",
-                            nominal=float(m.group(1)), plus_tol=float(m.group(2)),
-                            minus_tol=float(m.group(3)), meas=float(m.group(4)),
-                            dev=float(m.group(5)), outtol=float(m.group(6)),
-                            page=page_num + 1,
-                        ))
-                    except ValueError:
-                        pass
+                if m:
+                    local_name, local_type = nearest_img_name(i)
+                    name  = local_name or cur_name
+                    ftype = local_type or cur_type or "CIR"
+                    if name:
+                        try:
+                            nominal = float(m.group(1))
+                            plus_t  = float(m.group(2))
+                            minus_t = float(m.group(3))
+                            meas    = float(m.group(4))
+                            dev     = round(meas - nominal, 6)
+                            features.append(CMMFeature(
+                                name=name, feature_type=ftype, axis="D",
+                                nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
+                                meas=meas, dev=dev,
+                                outtol=_compute_outtol(dev, plus_t, minus_t),
+                                page=page_num + 1,
+                            ))
+                        except ValueError:
+                            pass
                     continue
 
                 # Axis row: "M 11.900 0.030 0.030 11.520 -0.380 0.350"
                 m = RE_AXIS_ROW.match(line)
-                if m and cur_name:
-                    try:
-                        features.append(CMMFeature(
-                            name=cur_name, feature_type=cur_type or "LIN", axis=m.group(1),
-                            nominal=float(m.group(2)), plus_tol=float(m.group(3)),
-                            minus_tol=float(m.group(4)), meas=float(m.group(5)),
-                            dev=float(m.group(6)), outtol=float(m.group(7)),
-                            page=page_num + 1,
-                        ))
-                    except ValueError:
-                        pass
+                if m:
+                    local_name, local_type = nearest_img_name(i)
+                    name  = local_name or cur_name
+                    ftype = local_type or cur_type or "LIN"
+                    if name:
+                        try:
+                            nominal = float(m.group(2))
+                            plus_t  = float(m.group(3))
+                            minus_t = float(m.group(4))
+                            meas    = float(m.group(5))
+                            dev     = round(meas - nominal, 6)
+                            features.append(CMMFeature(
+                                name=name, feature_type=ftype, axis=m.group(1),
+                                nominal=nominal, plus_tol=plus_t, minus_tol=minus_t,
+                                meas=meas, dev=dev,
+                                outtol=_compute_outtol(dev, plus_t, minus_t),
+                                page=page_num + 1,
+                            ))
+                        except ValueError:
+                            pass
 
     if verbose and not tqdm:
         print()  # newline after fallback progress line

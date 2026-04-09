@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Register — CNC Setter{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+  <div class="col-sm-10 col-md-6 col-lg-4">
+    <div class="text-center mb-4">
+      <i class="bi bi-cpu-fill text-primary" style="font-size:3rem;"></i>
+      <h2 class="mt-2 fw-bold">CNC Setter</h2>
+      {% if first_user %}
+      <p class="text-muted small">Create the first admin account</p>
+      {% else %}
+      <p class="text-muted small">Create your account</p>
+      {% endif %}
+    </div>
+    <div class="card shadow">
+      <div class="card-body p-4">
+        <h5 class="card-title mb-4 fw-semibold">Register</h5>
+        <form method="post">
+          <div class="mb-3">
+            <label class="form-label text-muted small">Username</label>
+            <input type="text" name="username" class="form-control" placeholder="choose a username" autofocus required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label text-muted small">Password <span class="text-muted">(min 6 chars)</span></label>
+            <input type="password" name="password" class="form-control" placeholder="••••••" required>
+          </div>
+          <div class="mb-4">
+            <label class="form-label text-muted small">Confirm password</label>
+            <input type="password" name="confirm" class="form-control" placeholder="••••••" required>
+          </div>
+          <button type="submit" class="btn btn-primary w-100 fw-semibold">
+            <i class="bi bi-person-plus me-2"></i>Create account
+          </button>
+        </form>
+      </div>
+    </div>
+    <p class="text-center text-muted small mt-3">
+      Already have an account? <a href="{{ url_for('login') }}" class="text-primary">Sign in</a>
+    </p>
+  </div>
+</div>
+{% endblock %}

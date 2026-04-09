@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Login — CNC Setter{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+  <div class="col-sm-10 col-md-6 col-lg-4">
+    <div class="text-center mb-4">
+      <i class="bi bi-cpu-fill text-primary" style="font-size:3rem;"></i>
+      <h2 class="mt-2 fw-bold">CNC Setter</h2>
+      <p class="text-muted small">CMM &amp; NC offset recommendation tool</p>
+    </div>
+    <div class="card shadow">
+      <div class="card-body p-4">
+        <h5 class="card-title mb-4 fw-semibold">Sign in</h5>
+        <form method="post">
+          <div class="mb-3">
+            <label class="form-label text-muted small">Username</label>
+            <input type="text" name="username" class="form-control" placeholder="your username" autofocus required>
+          </div>
+          <div class="mb-4">
+            <label class="form-label text-muted small">Password</label>
+            <input type="password" name="password" class="form-control" placeholder="••••••" required>
+          </div>
+          <button type="submit" class="btn btn-primary w-100 fw-semibold">
+            <i class="bi bi-box-arrow-in-right me-2"></i>Login
+          </button>
+        </form>
+      </div>
+    </div>
+    <p class="text-center text-muted small mt-3">
+      No account? <a href="{{ url_for('register') }}" class="text-primary">Register</a>
+    </p>
+  </div>
+</div>
+{% endblock %}

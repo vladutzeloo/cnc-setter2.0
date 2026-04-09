@@ -8,4 +8,4 @@ dist/
 build/
 .env
 .venv
-*.html
+test_report.html

@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}New Report — CNC Setter{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-12 col-lg-7 col-xl-6">
+    <div class="mb-4">
+      <h3 class="fw-bold mb-0">New Report</h3>
+      <p class="text-muted small mb-0">Upload your CMM PDF and NC program files</p>
+    </div>
+
+    <div class="card shadow">
+      <div class="card-body p-4">
+        <form method="post" enctype="multipart/form-data" id="uploadForm">
+          <!-- Part name -->
+          <div class="mb-4">
+            <label class="form-label fw-semibold">Part name</label>
+            <input type="text" name="part_name" class="form-control" placeholder="e.g. Housing Block Ø309 Rev.C">
+            <div class="form-text text-muted">Optional — displayed in the report header and dashboard.</div>
+          </div>
+
+          <!-- CMM PDF -->
+          <div class="mb-4">
+            <label class="form-label fw-semibold">
+              CMM Report PDF <span class="text-danger">*</span>
+            </label>
+            <input type="file" name="cmm_pdf" class="form-control" accept=".pdf" required id="cmmInput">
+            <div class="form-text text-muted">Calypso or similar image-based PDF CMM report.</div>
+            <div id="cmmPreview" class="mt-2 text-muted small" style="display:none;">
+              <i class="bi bi-check-circle text-success me-1"></i><span></span>
+            </div>
+          </div>
+
+          <!-- NC files -->
+          <div class="mb-4">
+            <label class="form-label fw-semibold">
+              NC Program files <span class="text-danger">*</span>
+            </label>
+            <input type="file" name="nc_files" class="form-control" accept=".nc,.cnc,.mpf,.h,.prg" multiple required id="ncInput">
+            <div class="form-text text-muted">HyperMill NC programs (.nc, .cnc, .mpf, .h, .prg). Multiple allowed.</div>
+            <div id="ncPreview" class="mt-2 text-muted small" style="display:none;"></div>
+          </div>
+
+          <!-- Drawing PDF (optional) -->
+          <div class="mb-4">
+            <label class="form-label fw-semibold">
+              Drawing PDF <span class="text-muted fw-normal">(optional)</span>
+            </label>
+            <input type="file" name="drawing_pdf" class="form-control" accept=".pdf" id="drawingInput">
+            <div class="form-text text-muted">Upload to enable the side-by-side drawing viewer in the report.</div>
+            <div id="drawingPreview" class="mt-2 text-muted small" style="display:none;">
+              <i class="bi bi-check-circle text-success me-1"></i><span></span>
+            </div>
+          </div>
+
+          <hr style="border-color:var(--card-border);">
+
+          <button type="submit" class="btn btn-primary w-100 fw-semibold" id="submitBtn">
+            <i class="bi bi-lightning-charge-fill me-2"></i>Generate Report
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Processing overlay info -->
+    <div id="processingBanner" class="card mt-3 text-center py-3" style="display:none; border-color:var(--accent);">
+      <div class="card-body">
+        <div class="spinner-border text-primary mb-2" role="status"></div>
+        <p class="mb-0 fw-semibold">Processing files&hellip;</p>
+        <p class="text-muted small mb-0">OCR and correlation may take 15–60 seconds.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function previewFile(inputEl, previewEl, labelEl) {
+  inputEl.addEventListener('change', function() {
+    if (this.files.length === 0) { previewEl.style.display = 'none'; return; }
+    if (this.files.length === 1) {
+      labelEl.textContent = this.files[0].name;
+    } else {
+      labelEl.innerHTML = this.files.length + ' files selected: ' + Array.from(this.files).map(f => f.name).join(', ');
+    }
+    previewEl.style.display = '';
+  });
+}
+
+previewFile(document.getElementById('cmmInput'),
+            document.getElementById('cmmPreview'),
+            document.getElementById('cmmPreview').querySelector('span'));
+
+previewFile(document.getElementById('drawingInput'),
+            document.getElementById('drawingPreview'),
+            document.getElementById('drawingPreview').querySelector('span'));
+
+const ncInput   = document.getElementById('ncInput');
+const ncPreview = document.getElementById('ncPreview');
+ncInput.addEventListener('change', function() {
+  if (this.files.length === 0) { ncPreview.style.display = 'none'; return; }
+  let html = '<i class="bi bi-check-circle text-success me-1"></i>';
+  html += Array.from(this.files).map(f =>
+    '<span class="badge badge-low rounded-pill me-1 px-2 py-1">' + f.name + '</span>'
+  ).join('');
+  ncPreview.innerHTML = html;
+  ncPreview.style.display = '';
+});
+
+document.getElementById('uploadForm').addEventListener('submit', function() {
+  document.getElementById('submitBtn').disabled = true;
+  document.getElementById('submitBtn').innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Processing…';
+  document.getElementById('processingBanner').style.display = '';
+});
+</script>
+{% endblock %}

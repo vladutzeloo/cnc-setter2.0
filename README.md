@@ -1,12 +1,12 @@
 # CNC Setter 2.0
 
-A web application that reads Calypso CMM inspection reports and HyperMill NC programs, then recommends which tool offsets to adjust and by how much.
+A web application that reads  CMM inspection reports and HyperMill NC programs, then recommends which tool offsets to adjust and by how much.
 
 ---
 
 ## What it does
 
-1. You upload a CMM PDF (image-based Calypso report) and one or more NC program files.
+1. You upload a CMM PDF (image-based  report) and one or more NC program files.
 2. The parser OCR-reads every measured feature from the CMM report.
 3. It parses the NC files to extract every machining operation and the tool that ran it.
 4. It correlates CMM features to NC tools by matching diameters and operation types.
